@@ -4461,32 +4461,95 @@ async def check_quest_name_availability(name: str):
 async def get_user_profile(identifier: str):
     """
     Smart endpoint: Search by Username OR Wallet Address.
+    Also merges any connected accounts from `linked_socials` so the quest page
+    always sees synced social links (especially Telegram).
     """
     try:
-        # 1. Try searching by Wallet Address first (Exact Match)
-        # We assume identifiers starting with '0x' are wallets
+        # 1. Search by Wallet Address first (Exact Match), otherwise Username
         if identifier.startswith("0x") and len(identifier) == 42:
-            response = supabase.table("user_profiles")\
-                .select("*")\
-                .eq("wallet_address", identifier.lower())\
+            response = supabase.table("user_profiles") \
+                .select("*") \
+                .eq("wallet_address", identifier.lower()) \
                 .execute()
         else:
-            # 2. Otherwise, treat as Username (Case Insensitive)
-            response = supabase.table("user_profiles")\
-                .select("*")\
-                .ilike("username", identifier)\
+            response = supabase.table("user_profiles") \
+                .select("*") \
+                .ilike("username", identifier) \
                 .execute()
-        
+
         if not response.data:
             raise HTTPException(status_code=404, detail="User not found")
-            
-        return {"success": True, "profile": response.data[0]}
-        
+
+        profile = response.data[0]
+        wallet_lower = (profile.get("wallet_address") or "").lower()
+
+        # 2. Merge linked_socials into the profile response & backfill missing fields
+        if wallet_lower:
+            try:
+                socials_res = supabase.table("linked_socials") \
+                    .select("provider, provider_user_id, username, handle, email") \
+                    .eq("wallet_address", wallet_lower) \
+                    .execute()
+
+                updates_to_sync = {}
+
+                for row in (socials_res.data or []):
+                    provider = (row.get("provider") or "").lower()
+                    handle = row.get("handle") or row.get("username")
+                    provider_id = row.get("provider_user_id")
+                    social_email = row.get("email")
+
+                    if provider == "telegram":
+                        if not profile.get("telegram_user_id") and provider_id:
+                            profile["telegram_user_id"] = str(provider_id)
+                            updates_to_sync["telegram_user_id"] = str(provider_id)
+                        # Fallback: if telegram_handle is null, populate from handle or ID
+                        # so frontend checks for `profile.telegram_handle` pass
+                        if not profile.get("telegram_handle"):
+                            tg_val = handle or (str(provider_id) if provider_id else None)
+                            if tg_val:
+                                profile["telegram_handle"] = tg_val
+                                updates_to_sync["telegram_handle"] = tg_val
+
+                    elif provider in ("twitter", "x"):
+                        if not profile.get("twitter_handle") and handle:
+                            profile["twitter_handle"] = handle
+                            updates_to_sync["twitter_handle"] = handle
+                        if not profile.get("twitter_id") and provider_id:
+                            profile["twitter_id"] = str(provider_id)
+                            updates_to_sync["twitter_id"] = str(provider_id)
+
+                    elif provider == "discord":
+                        if not profile.get("discord_handle") and handle:
+                            profile["discord_handle"] = handle
+                            updates_to_sync["discord_handle"] = handle
+                        if not profile.get("discord_id") and provider_id:
+                            profile["discord_id"] = str(provider_id)
+                            updates_to_sync["discord_id"] = str(provider_id)
+
+                    elif provider == "google" and not profile.get("email") and social_email:
+                        profile["email"] = social_email
+                        updates_to_sync["email"] = social_email
+
+                # Persist synced fields back to user_profiles so future queries are instant
+                if updates_to_sync:
+                    updates_to_sync["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    supabase.table("user_profiles") \
+                        .update(updates_to_sync) \
+                        .eq("wallet_address", wallet_lower) \
+                        .execute()
+
+            except Exception as sync_err:
+                print(f"⚠️ linked_socials sync warning for {wallet_lower}: {sync_err}")
+
+        return {"success": True, "profile": profile}
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+        
+           
 @app.get("/api/profile/user/{username}")
 async def get_profile_by_username(username: str):
     """
@@ -8307,8 +8370,8 @@ async def delete_quest(faucet_address: str, body: DeleteQuestRequest):
     except Exception as e:
         print(f"❌ delete_quest error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
-     
+
+
 @app.put("/api/quests/{faucet_address}/submissions/{submission_id}")
 async def update_submission(
     faucet_address: str,
