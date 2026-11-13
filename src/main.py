@@ -8268,38 +8268,46 @@ async def admin_approve_submission(req: ApprovalRequest):
 
 
 @app.delete("/api/quest/{faucet_address}")
-async def delete_quest(
-    faucet_address: str,
-    body: DeleteQuestRequest,
-    db: asyncpg.Pool = Depends(get_db),
-):
-    quest = await db.fetchrow("""
-        SELECT id, title, creator_address, rewards_distributed
-        FROM quests
-        WHERE faucet_address = $1
-    """, faucet_address)
+async def delete_quest(faucet_address: str, body: DeleteQuestRequest):
+    try:
+        quest_res = supabase.table("quests").select(
+            "title, creator_address, rewards_distributed"
+        ).eq("faucet_address", faucet_address).execute()
+        if not quest_res.data:
+            raise HTTPException(status_code=404, detail="Quest not found")
+        quest = quest_res.data[0]
 
-    if not quest:
-        raise HTTPException(status_code=404, detail="Quest not found")
+        caller = body.walletAddress.lower()
+        if (quest.get("creator_address") or "").lower() != caller and caller != PLATFORM_OWNER.lower():
+            raise HTTPException(status_code=403, detail="Only the quest owner can delete this quest")
 
-    if quest["creator_address"].lower() != body.walletAddress.lower() and body.walletAddress.lower() != PLATFORM_OWNER.lower():
-        raise HTTPException(status_code=403, detail="Only the quest owner can delete this quest")
+        if (quest.get("title") or "").strip().lower() != body.questTitle.strip().lower():
+            raise HTTPException(status_code=400, detail="Quest name does not match. Please type the exact quest name.")
 
-    if quest["title"].strip().lower() != body.questTitle.strip().lower():
-        raise HTTPException(status_code=400, detail="Quest name does not match. Please type the exact quest name.")
+        if quest.get("rewards_distributed"):
+            raise HTTPException(status_code=400, detail="Cannot delete a quest that has already distributed rewards")
 
-    if quest["rewards_distributed"]:
-        raise HTTPException(status_code=400, detail="Cannot delete a quest that has already distributed rewards")
+        # Children first, then the quest itself
+        for table, col in (
+            ("submissions",        "faucet_address"),
+            ("quest_participants", "quest_address"),
+            ("pending_referrals",  "quest_address"),
+            ("quest_admins",       "quest_address"),
+            ("faucet_tasks",       "faucet_address"),
+        ):
+            try:
+                supabase.table(table).delete().eq(col, faucet_address).execute()
+            except Exception as e:
+                print(f"⚠️ delete_quest: cleanup of {table} failed: {e}")
 
-    quiz_id = quest["id"]
-
-    async with db.transaction():
-        await db.execute("DELETE FROM quest_participants  WHERE quest_address = $1", faucet_address)
-        await db.execute("DELETE FROM quest_tasks         WHERE quest_id = $1",      quiz_id)
-        await db.execute("DELETE FROM quest_submissions   WHERE quest_id = $1",      quiz_id)
-        await db.execute("DELETE FROM quests              WHERE id = $1",            quiz_id)
-
-    return {"success": True, "message": f"Quest '{quest['title']}' deleted successfully"}
+        supabase.table("quests").delete().eq("faucet_address", faucet_address).execute()
+        return {"success": True, "message": f"Quest '{quest.get('title')}' deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ delete_quest error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
      
 @app.put("/api/quests/{faucet_address}/submissions/{submission_id}")
 async def update_submission(
