@@ -9779,16 +9779,10 @@ OEMBED_HOSTS = ["https://publish.x.com/oembed", "https://publish.twitter.com/oem
 _oembed_cache: dict[str, str] = {}  # tweet_id -> lowercase embed html (successes only)
 
 
-
 async def check_tag_via_oembed(tweet_url: str, required_text: str) -> dict:
     """
     Returns {"success": bool, "reason": str, "message": str}
-    reason:
-      "ok"          -> tag found
-      "not_found"   -> tweet 404 / private        (USER problem -> delete, retry)
-      "missing_tag" -> tweet exists, tag missing  (USER problem -> delete, retry)
-      "invalid_url" -> bad URL                    (USER problem -> delete, retry)
-      "x_error"     -> X unreachable/blocked/etc  (NOT user's fault -> pending for admin)
+    reason: ok | not_found | missing_tag | invalid_url | x_error
     """
     try:
         text_to_check = required_text.lower().strip()
@@ -9802,20 +9796,17 @@ async def check_tag_via_oembed(tweet_url: str, required_text: str) -> dict:
         username, tweet_id = match.group(1), match.group(2)
         standardized_url = f"https://twitter.com/{username}/status/{tweet_id}"
 
-        # Cache hit (user retrying / re-checking the same tweet)
         html_content = _oembed_cache.get(tweet_id)
 
         if html_content is None:
             client_options = {
                 "timeout": 10.0,
-                "follow_redirects": True,  # twitter.com -> x.com redirects
+                "follow_redirects": True,
                 "headers": {"User-Agent": "Mozilla/5.0 (compatible; FaucetDropsBot/1.0)"},
-            }
-            if PROXY_URL:
-                client_options["proxy"] = PROXY_URL
+            }  # no proxy: direct connection, same as your original code
 
             last_status = None
-            max_attempts = 3  # per host
+            max_attempts = 2  # per host
 
             async with httpx.AsyncClient(**client_options) as client:
                 for host in OEMBED_HOSTS:
@@ -9825,7 +9816,7 @@ async def check_tag_via_oembed(tweet_url: str, required_text: str) -> dict:
                         except (httpx.RequestError, httpx.TimeoutException) as e:
                             last_status = f"network:{type(e).__name__}"
                             print(f"[oEmbed] {host} attempt={attempt} network error: {e}")
-                            await asyncio.sleep(1.5 * attempt)
+                            await asyncio.sleep(1.0 * attempt)
                             continue
 
                         last_status = resp.status_code
@@ -9837,40 +9828,32 @@ async def check_tag_via_oembed(tweet_url: str, required_text: str) -> dict:
                             break
 
                         if resp.status_code == 404:
-                            # Definitive: tweet missing/private/deleted
-                            return {
-                                "success": False,
-                                "reason": "not_found",
-                                "message": "Tweet not found or is private."
-                            }
+                            return {"success": False, "reason": "not_found",
+                                    "message": "Tweet not found or is private."}
 
                         if resp.status_code in (429, 500, 502, 503, 504):
-                            await asyncio.sleep(1.5 * attempt)  # backoff, retry
+                            await asyncio.sleep(1.0 * attempt)
                             continue
 
-                        # 403 etc. -> don't hammer this host, try the next one
-                        break
+                        break  # 403 etc. -> try next host
 
                     if html_content is not None:
                         break
 
             if html_content is None:
                 print(f"[oEmbed] all hosts failed. last_status={last_status}")
-                return {
-                    "success": False,
-                    "reason": "x_error",
-                    "message": "X verification unavailable."
-                }
+                return {"success": False, "reason": "x_error",
+                        "message": "X verification unavailable."}
 
         if text_to_check in html_content:
-            return {"success": True, "reason": "ok", "message": f"Required text '{text_to_check}' found!"}
+            return {"success": True, "reason": "ok",
+                    "message": f"Required text '{text_to_check}' found!"}
 
         return {"success": False, "reason": "missing_tag", "message": "Post missing requirement"}
 
     except Exception as e:
         print(f"oEmbed Tag Check Error: {e}")
         return {"success": False, "reason": "x_error", "message": "X verification unavailable."}
-
 
 @app.post("/api/tasks/verify-x-share")
 async def verify_x_share(
