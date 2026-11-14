@@ -1359,6 +1359,7 @@ class QuestMetaUpdate(BaseModel):
     imageUrl: Optional[str] = None
     distributionConfig: Optional[Dict[str, Any]] = None  # <--- ADD THIS
     rewardPool: Optional[str] = None                     # <--- ADD THIS
+
 class QuestTasksUpdate(BaseModel):
     """
     Replace the non-system tasks for a quest.
@@ -1367,6 +1368,10 @@ class QuestTasksUpdate(BaseModel):
     """
     adminAddress: str
     tasks: List[QuestTaskEdit]
+    # Task a referred friend must complete before the referrer earns points.
+    # "none" = no requirement. Omitted = leave as is.
+    referralRequiredTaskId: Optional[str] = None
+
 class JoinQuestRequest(BaseModel):
     walletAddress: str
     referralCode: Optional[str] = None # Optional code from the person who invited them
@@ -6412,7 +6417,140 @@ async def finalize_quest(finalize: QuestFinalize,background_tasks: BackgroundTas
         print(f"❌ Error finalizing quest: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================================
+# DEMO QUEST → LIVE
+# ============================================================
+class QuestGoLiveRequest(BaseModel):
+    creatorAddress: str
+    deployedAddress: str
 
+
+def _load_demo_quest_for_go_live(quest_id: str, creator_address: str) -> dict:
+    """Loads a demo quest and checks the caller may take it live."""
+    if not quest_id.startswith(("draft-", "demo-")):
+        raise HTTPException(status_code=400, detail="This quest is already live")
+
+    res = supabase.table("quests").select("*").eq("faucet_address", quest_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Quest not found")
+    quest = res.data[0]
+
+    creator = (quest.get("creator_address") or "").lower()
+    if creator != (creator_address or "").lower():
+        raise HTTPException(status_code=403, detail="Only the quest creator can take this quest live")
+
+    # Active subscription required
+    prof = supabase.table("user_profiles").select(
+        "is_quest_subscribed, quest_subscription_expires_at"
+    ).eq("wallet_address", creator).execute()
+    sub = prof.data[0] if prof.data else {}
+    active = bool(sub.get("is_quest_subscribed"))
+    expires = sub.get("quest_subscription_expires_at")
+    if active and expires:
+        exp_dt = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        active = exp_dt > datetime.now(timezone.utc)
+    if not active:
+        raise HTTPException(status_code=403, detail="An active subscription is required to go live")
+
+    # The contract needs an end time in the future
+    end_raw = quest.get("end_date")
+    if not end_raw:
+        raise HTTPException(status_code=400, detail="This quest has no end date")
+    end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    if end_dt <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="This quest has already ended and cannot go live")
+
+    quest["_end_timestamp"] = int(end_dt.timestamp())
+    return quest
+
+
+@app.get("/api/quests/{quest_id}/go-live", tags=["Quest Management"])
+async def get_go_live_info(quest_id: str, creatorAddress: str):
+    """What the frontend needs to deploy the contract for a demo quest."""
+    try:
+        quest = _load_demo_quest_for_go_live(quest_id, creatorAddress)
+        return {
+            "success": True,
+            "title": quest.get("title"),
+            "chainId": quest.get("chain_id"),
+            "tokenAddress": quest.get("token_address"),
+            "endTimestamp": quest["_end_timestamp"],
+            "claimWindowHours": int(quest.get("claim_window_hours") or 168),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/quests/{quest_id}/go-live", tags=["Quest Management"])
+async def go_live_demo_quest(quest_id: str, req: QuestGoLiveRequest):
+    """
+    Moves a demo quest onto its newly deployed contract address.
+    Title, slug, tasks, dates and admins are kept.
+    """
+    try:
+        quest = _load_demo_quest_for_go_live(quest_id, req.creatorAddress)
+
+        if not Web3.is_address(req.deployedAddress):
+            raise HTTPException(status_code=400, detail="Invalid deployed contract address")
+        new_address = smart_checksum(req.deployedAddress)
+
+        taken = supabase.table("quests").select("faucet_address").eq(
+            "faucet_address", new_address
+        ).execute()
+        if taken.data:
+            raise HTTPException(status_code=400, detail="That contract is already used by another quest")
+
+        # Make sure a contract really exists at that address
+        try:
+            w3 = await get_web3_instance(quest.get("chain_id"))
+            has_code = len(w3.eth.get_code(new_address)) > 0
+        except Exception as e:
+            print(f"⚠️ go-live: could not check contract code: {e}")
+            has_code = True
+        if not has_code:
+            raise HTTPException(status_code=400, detail="No contract found at that address on the quest's network")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # 1. Quest row — same row, new address
+        res = supabase.table("quests").update({
+            "faucet_address": new_address,
+            "is_draft": False,
+            "is_active": True,
+            "is_funded": False,
+            "rewards_distributed": False,
+            "updated_at": now_iso,
+        }).eq("faucet_address", quest_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Could not update the quest")
+
+        # 2. Tasks and admins follow the quest
+        for table, col in (("faucet_tasks", "faucet_address"), ("quest_admins", "quest_address")):
+            try:
+                supabase.table(table).update({col: new_address}).eq(col, quest_id).execute()
+            except Exception as e:
+                print(f"⚠️ go-live: moving {table} failed: {e}")
+
+        print(f"🚀 Demo quest {quest_id} is now live at {new_address}")
+        return {
+            "success": True,
+            "message": "Quest is now live!",
+            "faucetAddress": new_address,
+            "slug": quest.get("slug"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ go-live error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+        
 @app.get("/api/quests/{faucet_address}/participant/{wallet_address}", tags=["Quest Actions"])
 async def get_quest_participant(faucet_address: str, wallet_address: str):
     try:
@@ -10517,6 +10655,7 @@ async def update_quest_meta(faucet_address: str, payload: QuestMetaUpdate):
         print(f"💥 update_quest_meta error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+    
 @app.patch("/api/quests/{faucet_address}/tasks", tags=["Quest Management"])
 async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
     """
@@ -10524,15 +10663,17 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
     • System tasks (id starts with 'sys_' or isSystem=True) already stored in
       the DB are automatically preserved and re-appended after the update.
     • Caller must be the quest creator.
-    • Points must be positive integers.
+    • Points must be non-negative integers.
     • Stage must be one of: Beginner, Intermediate, Advance, Legend, Ultimate.
+    • referralRequiredTaskId sets the compulsory task for referrals.
     """
     VALID_STAGES = {"Beginner", "Intermediate", "Advance", "Legend", "Ultimate"}
     try:
-        if not Web3.is_address(faucet_address) or not Web3.is_address(payload.adminAddress):
+        if not Web3.is_address(payload.adminAddress):
             raise HTTPException(status_code=400, detail="Invalid address format")
-        faucet_cs = smart_checksum(faucet_address)
+        faucet_cs = _quest_key(faucet_address)
         admin_cs  = smart_checksum(payload.adminAddress)
+
         # 1. Auth check
         quest_res = supabase.table("quests").select("creator_address").eq(
             "faucet_address", faucet_cs
@@ -10542,6 +10683,7 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
         creator = quest_res.data[0]["creator_address"]
         if creator.lower() != admin_cs.lower() and admin_cs.lower() != PLATFORM_OWNER.lower():
             raise HTTPException(status_code=403, detail="Only the quest creator can perform this action")
+
         # 2. Validate incoming tasks
         incoming_tasks = []
         for t in payload.tasks:
@@ -10570,6 +10712,7 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
                     detail=f"Points must be a non-negative integer for task '{t.id}'"
                 )
             incoming_tasks.append(task_dict)
+
         # 3. Fetch current tasks to preserve system tasks
         existing_res = supabase.table("faucet_tasks").select("tasks").eq(
             "faucet_address", faucet_cs
@@ -10578,8 +10721,29 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
         if existing_res.data:
             all_existing = existing_res.data[0].get("tasks") or []
             system_tasks = [t for t in all_existing if _is_system_task(t)]
+
+        # 3b. Compulsory task for referrals (stored on the sys_referral task)
+        incoming_ids = {str(t.get("id")) for t in incoming_tasks}
+        new_required = payload.referralRequiredTaskId
+        if new_required not in (None, "none") and new_required not in incoming_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="The compulsory referral task must be one of this quest's tasks"
+            )
+        for st in system_tasks:
+            if st.get("id") != "sys_referral":
+                continue
+            if new_required == "none":
+                st.pop("requiredRefereeTaskId", None)
+            elif new_required is not None:
+                st["requiredRefereeTaskId"] = new_required
+            elif st.get("requiredRefereeTaskId") not in incoming_ids:
+                # Not changed, but the task it pointed to was deleted
+                st.pop("requiredRefereeTaskId", None)
+
         # 4. Merge: system tasks first, then user tasks
         merged_tasks = system_tasks + incoming_tasks
+
         # 5. Upsert faucet_tasks
         upsert_payload = {
             "faucet_address": faucet_cs,
@@ -10592,6 +10756,7 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
         ).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Task update failed")
+
         print(
             f"✅ Tasks updated for {faucet_cs}: "
             f"{len(system_tasks)} system + {len(incoming_tasks)} user tasks"
@@ -10609,17 +10774,19 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
         print(f"💥 update_quest_tasks error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/quests/{faucet_address}/tasks/editable", tags=["Quest Management"])
 async def get_editable_tasks(faucet_address: str, adminAddress: str):
     """
-    Returns only the user-editable (non-system) tasks for the admin panel.
-    System tasks are excluded from the response.
+    Returns only the user-editable (non-system) tasks for the admin panel,
+    plus the current compulsory task for referrals.
     """
     try:
-        if not Web3.is_address(faucet_address) or not Web3.is_address(adminAddress):
+        if not Web3.is_address(adminAddress):
             raise HTTPException(status_code=400, detail="Invalid address format")
-        faucet_cs = smart_checksum(faucet_address)
+        faucet_cs = _quest_key(faucet_address)
         admin_cs  = smart_checksum(adminAddress)
+
         # Auth check
         quest_res = supabase.table("quests").select("creator_address").eq(
             "faucet_address", faucet_cs
@@ -10629,6 +10796,7 @@ async def get_editable_tasks(faucet_address: str, adminAddress: str):
         creator = quest_res.data[0]["creator_address"]
         if creator.lower() != admin_cs.lower() and admin_cs.lower() != PLATFORM_OWNER.lower():
             raise HTTPException(status_code=403, detail="Only the quest creator can perform this action")
+
         # Fetch tasks
         tasks_res = supabase.table("faucet_tasks").select("tasks").eq(
             "faucet_address", faucet_cs
@@ -10638,17 +10806,20 @@ async def get_editable_tasks(faucet_address: str, adminAddress: str):
             all_tasks = tasks_res.data[0].get("tasks") or []
         user_tasks   = [t for t in all_tasks if not _is_system_task(t)]
         system_tasks = [t for t in all_tasks if _is_system_task(t)]
+
+        referral_task = next((t for t in system_tasks if t.get("id") == "sys_referral"), None)
         return {
             "success": True,
             "userTasks": user_tasks,
             "systemTasksCount": len(system_tasks),
             "totalTasks": len(all_tasks),
+            "hasReferralTask": referral_task is not None,
+            "referralRequiredTaskId": (referral_task or {}).get("requiredRefereeTaskId") or "none",
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 # ============================================================
