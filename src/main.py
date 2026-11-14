@@ -3266,7 +3266,57 @@ async def process_auto_approval(submission_id: str, faucet_address: str, wallet_
             print(f"🗑️ Deleted stuck submission {submission_id} so user can retry.")
         except Exception as cleanup_err:
             print(f"⚠️ Failed to clean up submission {submission_id}: {cleanup_err}")
-               
+def _quest_key(faucet_address: str) -> str:
+    """Quest ID as stored: draft-/demo- IDs as-is, contract addresses checksummed."""
+    if faucet_address.startswith(("draft-", "demo-")):
+        return faucet_address
+    if not Web3.is_address(faucet_address):
+        raise HTTPException(status_code=400, detail="Invalid address format")
+    return smart_checksum(faucet_address)
+
+def _reapply_referral_requirement(faucet_cs: str, new_required: Optional[str]) -> int:
+    """
+    Applies a changed compulsory referral task to every pending referral
+    in the quest. Returns how many referrers were awarded.
+    """
+    awarded = 0
+    pending_res = supabase.table("pending_referrals").select("*") \
+        .eq("quest_address", faucet_cs).eq("awarded", False).execute()
+
+    for pending in (pending_res.data or []):
+        referee  = pending["referee_wallet"]
+        referrer = pending["referrer_wallet"]
+
+        fulfilled = not new_required
+        if not fulfilled:
+            prog = supabase.table("user_progress").select("completed_tasks") \
+                .eq("faucet_address", faucet_cs).eq("wallet_address", referee).execute()
+            done = (prog.data[0].get("completed_tasks") or []) if prog.data else []
+            fulfilled = new_required in done
+
+        if not fulfilled:
+            # Not done yet — the referral now waits on the new task
+            supabase.table("pending_referrals").update({"required_task_id": new_required}) \
+                .eq("quest_address", faucet_cs).eq("referee_wallet", referee).execute()
+            continue
+
+        # Mark as awarded first so a retry can never pay twice
+        supabase.table("pending_referrals").update({"awarded": True}) \
+            .eq("quest_address", faucet_cs).eq("referee_wallet", referee).execute()
+
+        ref_part = supabase.table("quest_participants").select("points") \
+            .eq("quest_address", faucet_cs).eq("wallet_address", referrer).execute()
+        if ref_part.data:
+            points = int(pending.get("referral_points") or 200)
+            supabase.table("quest_participants").update({
+                "points": (ref_part.data[0].get("points") or 0) + points,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("quest_address", faucet_cs).eq("wallet_address", referrer).execute()
+            awarded += 1
+
+    return awarded
+
+
 def generate_slug(name: str):
     if not name:
         return "faucet"
@@ -10665,7 +10715,8 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
     • Caller must be the quest creator.
     • Points must be non-negative integers.
     • Stage must be one of: Beginner, Intermediate, Advance, Legend, Ultimate.
-    • referralRequiredTaskId sets the compulsory task for referrals.
+    • referralRequiredTaskId sets the compulsory task for referrals and is
+      applied to all pending referrals immediately.
     """
     VALID_STAGES = {"Beginner", "Intermediate", "Advance", "Legend", "Ultimate"}
     try:
@@ -10730,9 +10781,16 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
                 status_code=400,
                 detail="The compulsory referral task must be one of this quest's tasks"
             )
+
+        referral_changed = False
+        final_required: Optional[str] = None
         for st in system_tasks:
             if st.get("id") != "sys_referral":
                 continue
+            old_required = st.get("requiredRefereeTaskId")
+            if old_required == "none":
+                old_required = None
+
             if new_required == "none":
                 st.pop("requiredRefereeTaskId", None)
             elif new_required is not None:
@@ -10740,6 +10798,9 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
             elif st.get("requiredRefereeTaskId") not in incoming_ids:
                 # Not changed, but the task it pointed to was deleted
                 st.pop("requiredRefereeTaskId", None)
+
+            final_required = st.get("requiredRefereeTaskId") or None
+            referral_changed = final_required != old_required
 
         # 4. Merge: system tasks first, then user tasks
         merged_tasks = system_tasks + incoming_tasks
@@ -10757,6 +10818,15 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
         if not res.data:
             raise HTTPException(status_code=500, detail="Task update failed")
 
+        # 6. Apply a changed compulsory task to every pending referral now
+        referrals_awarded = 0
+        if referral_changed:
+            try:
+                referrals_awarded = _reapply_referral_requirement(faucet_cs, final_required)
+                print(f"🔁 Referral requirement changed for {faucet_cs}: {referrals_awarded} referrers awarded")
+            except Exception as e:
+                print(f"⚠️ Re-applying referral requirement failed: {e}")
+
         print(
             f"✅ Tasks updated for {faucet_cs}: "
             f"{len(system_tasks)} system + {len(incoming_tasks)} user tasks"
@@ -10767,6 +10837,7 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
             "totalTasks": len(merged_tasks),
             "systemTasksPreserved": len(system_tasks),
             "userTasksCount": len(incoming_tasks),
+            "referralsAwarded": referrals_awarded,
         }
     except HTTPException:
         raise
@@ -10775,6 +10846,7 @@ async def update_quest_tasks(faucet_address: str, payload: QuestTasksUpdate):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+    
 @app.get("/api/quests/{faucet_address}/tasks/editable", tags=["Quest Management"])
 async def get_editable_tasks(faucet_address: str, adminAddress: str):
     """
