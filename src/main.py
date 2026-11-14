@@ -75,6 +75,7 @@ import asyncpg
 from contextlib import asynccontextmanager
 DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql+asyncpg → just postgresql:// for asyncpg
 pool: asyncpg.Pool = None
+
 async def get_db():
     return await pool.acquire()
 async def release_db(conn):
@@ -9592,6 +9593,7 @@ async def load_quizzes_from_db():
     print(f"[Startup] Loaded {len(quizzes)} quizzes from database")
 
 
+    
 async def load_all_active_quizzes():
     """Optimized Bulk Fetch for Active Quizzes"""
     global quizzes, game_state, connections, player_sockets
@@ -9770,91 +9772,196 @@ class XShareVerifyRequest(BaseModel):
 
 import html
 
+
+dramatic_verification_tracker = {}
+
+OEMBED_HOSTS = ["https://publish.x.com/oembed", "https://publish.twitter.com/oembed"]
+_oembed_cache: dict[str, str] = {}  # tweet_id -> lowercase embed html (successes only)
+
+
+
 async def check_tag_via_oembed(tweet_url: str, required_text: str) -> dict:
     """
-    Checks if a tweet exists and contains `required_text`.
-    Tries X API v2 (if TWITTER_BEARER_TOKEN is set), then oEmbed with browser
-    headers, and falls back gracefully if X blocks the server's datacenter IP.
+    Returns {"success": bool, "reason": str, "message": str}
+    reason:
+      "ok"          -> tag found
+      "not_found"   -> tweet 404 / private        (USER problem -> delete, retry)
+      "missing_tag" -> tweet exists, tag missing  (USER problem -> delete, retry)
+      "invalid_url" -> bad URL                    (USER problem -> delete, retry)
+      "x_error"     -> X unreachable/blocked/etc  (NOT user's fault -> pending for admin)
     """
     try:
-        text_to_check = (required_text or "").lower().strip()
-
+        text_to_check = required_text.lower().strip()
         match = re.search(
             r'(?:x\.com|twitter\.com)/([a-zA-Z0-9_]{1,15})/status/(\d+)',
             tweet_url.lower()
         )
         if not match:
-            return {"success": False, "message": "Invalid X URL."}
+            return {"success": False, "reason": "invalid_url", "message": "Invalid X URL."}
 
         username, tweet_id = match.group(1), match.group(2)
         standardized_url = f"https://twitter.com/{username}/status/{tweet_id}"
 
-        # 1. Official X API v2 (if TWITTER_BEARER_TOKEN is configured in Render)
-        bearer_token = os.getenv("TWITTER_BEARER_TOKEN", "").strip()
-        if bearer_token:
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    api_resp = await client.get(
-                        f"https://api.twitter.com/2/tweets/{tweet_id}",
-                        headers={"Authorization": f"Bearer {bearer_token}"},
-                    )
-                if api_resp.status_code == 200:
-                    tweet_text = api_resp.json().get("data", {}).get("text", "").lower()
-                    if not text_to_check or text_to_check in tweet_text:
-                        return {"success": True, "message": f"Required text '{text_to_check}' found!"}
-                    return {"success": False, "message": "Post missing requirement"}
-                elif api_resp.status_code == 404:
-                    return {"success": False, "message": "Tweet not found or is private."}
-                else:
-                    print(f"⚠️ X API v2 returned {api_resp.status_code}: {api_resp.text[:200]}")
-            except Exception as api_err:
-                print(f"⚠️ X API v2 error, falling back to oEmbed: {api_err}")
+        # Cache hit (user retrying / re-checking the same tweet)
+        html_content = _oembed_cache.get(tweet_id)
 
-        # 2. Public oEmbed endpoint with browser headers + retry
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json",
-        }
+        if html_content is None:
+            client_options = {
+                "timeout": 10.0,
+                "follow_redirects": True,  # twitter.com -> x.com redirects
+                "headers": {"User-Agent": "Mozilla/5.0 (compatible; FaucetDropsBot/1.0)"},
+            }
+            if PROXY_URL:
+                client_options["proxy"] = PROXY_URL
 
-        last_status = None
-        for attempt in range(2):
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                response = await client.get(
-                    "https://publish.twitter.com/oembed",
-                    params={"url": standardized_url, "omit_script": "true"},
-                    headers=headers,
-                )
-            last_status = response.status_code
+            last_status = None
+            max_attempts = 3  # per host
 
-            if response.status_code == 200:
-                data = response.json()
-                html_content = html.unescape(data.get("html", "")).lower()
-                if not text_to_check or text_to_check in html_content:
-                    return {"success": True, "message": f"Required text '{text_to_check}' found!"}
-                return {"success": False, "message": "Post missing requirement"}
+            async with httpx.AsyncClient(**client_options) as client:
+                for host in OEMBED_HOSTS:
+                    for attempt in range(1, max_attempts + 1):
+                        try:
+                            resp = await client.get(host, params={"url": standardized_url})
+                        except (httpx.RequestError, httpx.TimeoutException) as e:
+                            last_status = f"network:{type(e).__name__}"
+                            print(f"[oEmbed] {host} attempt={attempt} network error: {e}")
+                            await asyncio.sleep(1.5 * attempt)
+                            continue
 
-            if response.status_code == 404:
-                return {"success": False, "message": "Tweet not found or is private."}
+                        last_status = resp.status_code
+                        print(f"[oEmbed] {host} attempt={attempt} status={resp.status_code} body={resp.text[:150]!r}")
 
-            print(f"⚠️ oEmbed attempt {attempt + 1} failed with HTTP {response.status_code}")
-            await asyncio.sleep(1)
+                        if resp.status_code == 200:
+                            html_content = resp.json().get("html", "").lower()
+                            _oembed_cache[tweet_id] = html_content
+                            break
 
-        # 3. Datacenter IP fallback (HTTP 403/429/5xx):
-        # verify_x_share already verified the tweet URL belongs to the user's connected X handle.
-        print(f"ℹ️ oEmbed blocked/unavailable (HTTP {last_status}); approving via handle-matched URL.")
-        return {"success": True, "message": "Post URL verified!"}
+                        if resp.status_code == 404:
+                            # Definitive: tweet missing/private/deleted
+                            return {
+                                "success": False,
+                                "reason": "not_found",
+                                "message": "Tweet not found or is private."
+                            }
+
+                        if resp.status_code in (429, 500, 502, 503, 504):
+                            await asyncio.sleep(1.5 * attempt)  # backoff, retry
+                            continue
+
+                        # 403 etc. -> don't hammer this host, try the next one
+                        break
+
+                    if html_content is not None:
+                        break
+
+            if html_content is None:
+                print(f"[oEmbed] all hosts failed. last_status={last_status}")
+                return {
+                    "success": False,
+                    "reason": "x_error",
+                    "message": "X verification unavailable."
+                }
+
+        if text_to_check in html_content:
+            return {"success": True, "reason": "ok", "message": f"Required text '{text_to_check}' found!"}
+
+        return {"success": False, "reason": "missing_tag", "message": "Post missing requirement"}
 
     except Exception as e:
         print(f"oEmbed Tag Check Error: {e}")
-        return {"success": False, "message": "Internal error during verification."}
-
-dramatic_verification_tracker = {}
+        return {"success": False, "reason": "x_error", "message": "X verification unavailable."}
 
 
+@app.post("/api/tasks/verify-x-share")
+async def verify_x_share(
+    request: XShareVerifyRequest,
+    background_tasks: BackgroundTasks
+):
+    submission_id = request.submissionId
+    try:
+        wallet = smart_checksum(request.walletAddress)
+        proof_url = request.proofUrl.strip().lower()
+        required_tag = request.requiredTag.strip()
+
+        profile_res = supabase.table("user_profiles") \
+            .select("twitter_handle") \
+            .eq("wallet_address", wallet.lower()) \
+            .execute()
+
+        if not profile_res.data or not profile_res.data[0].get("twitter_handle"):
+            await delete_submission(submission_id)
+            return {"verified": False, "message": "Please connect your X account in Profile Settings first."}
+
+        saved_handle = profile_res.data[0]["twitter_handle"].lower().replace("@", "")
+
+        match = re.search(
+            r'(?:x\.com|twitter\.com)/([a-zA-Z0-9_]{1,15})/status/(\d+)',
+            proof_url
+        )
+        if not match:
+            await delete_submission(submission_id)
+            return {"verified": False, "message": "Invalid X URL format."}
+
+        url_username = match.group(1)
+        if url_username.lower() == "i":
+            status_id = match.group(2)
+            url_username = saved_handle
+            proof_url = f"https://x.com/{saved_handle}/status/{status_id}"
+
+        if url_username != saved_handle:
+            await delete_submission(submission_id)
+            return {"verified": False, "message": "Error, do the task and try again."}
+
+        tag_check = await check_tag_via_oembed(proof_url, required_tag)
+
+        # ── X itself failed: not the user's fault -> send to admin review ──
+        if tag_check["reason"] == "x_error":
+            supabase.table("submissions").update({
+                "status": "pending",
+                "submitted_data": proof_url,
+                "notes": "Auto-verification unavailable (X error). Needs manual admin review. "
+                         f"Required tag: {required_tag}",
+            }).eq("submission_id", submission_id).execute()
+            return {
+                "verified": False,
+                "pending": True,  # frontend: show "under review", do NOT cancel/delete
+                "message": "⏳ X is unavailable right now. Your submission was sent to an admin for review."
+            }
+
+        # ── User didn't do the task correctly -> delete so they can retry ──
+        if not tag_check["success"]:
+            await delete_submission(submission_id)
+            return {"verified": False, "pending": False, "message": tag_check["message"]}
+
+        # ── Verified ──
+        sub_data = supabase.table("submissions") \
+            .select("faucet_address") \
+            .eq("submission_id", submission_id) \
+            .execute()
+        faucet_addr = sub_data.data[0]["faucet_address"] if sub_data.data else ""
+
+        supabase.table("submissions").update({"status": "approved"}) \
+            .eq("submission_id", submission_id).execute()
+        await process_auto_approval(submission_id, faucet_address=faucet_addr, wallet_address=wallet)
+
+        try:
+            quest_res = supabase.table("quests").select("chain_id") \
+                .eq("faucet_address", faucet_addr).execute()
+            chain_id = quest_res.data[0].get("chain_id", 42220) if quest_res.data else 42220
+            background_tasks.add_task(
+                _trigger_quest_action_onchain,
+                faucet_addr, wallet, "submitQuest", chain_id
+            )
+        except Exception as e:
+            print(f"⚠️ on-chain submit trigger failed: {e}")
+
+        return {"verified": True, "message": "✅ Post verified! Points awarded."}
+
+    except Exception as e:
+        print(f"X Share Verify Error: {e}")
+        await delete_submission(submission_id)   # guaranteed cleanup
+        return {"verified": False, "message": "Something went wrong during verification. Try again."}
+    
 # ====================== X VERIFICATION ======================
 @app.post("/api/tasks/verify-x-comment")
 async def verify_x_comment(request: XCommentVerifyRequest):
@@ -10007,79 +10114,7 @@ async def verify_x(request: XVerifyRequest, background_tasks: BackgroundTasks):
         return {"verified": False, "message": "Something went wrong. Try again."} 
       
 # ====================== X SYSTEM TASK (SHARE WITH TAG) ======================
-@app.post("/api/tasks/verify-x-share")
-async def verify_x_share(
-    request: XShareVerifyRequest,
-    background_tasks: BackgroundTasks
-):
-    submission_id = request.submissionId
-    try:
-        wallet = smart_checksum(request.walletAddress)
-        proof_url = request.proofUrl.strip().lower()
-        required_tag = request.requiredTag.strip()
- 
-        profile_res = supabase.table("user_profiles") \
-            .select("twitter_handle") \
-            .eq("wallet_address", wallet.lower()) \
-            .execute()
- 
-        if not profile_res.data or not profile_res.data[0].get("twitter_handle"):
-            await delete_submission(submission_id)
-            return {"verified": False, "message": "Please connect your X account in Profile Settings first."}
- 
-        saved_handle = profile_res.data[0]["twitter_handle"].lower().replace("@", "")
- 
-        match = re.search(
-            r'(?:x\.com|twitter\.com)/([a-zA-Z0-9_]{1,15})/status/(\d+)',
-            proof_url
-        )
-        if not match:
-            await delete_submission(submission_id)
-            return {"verified": False, "message": "Invalid X URL format."}
- 
-        url_username = match.group(1)
-        if url_username.lower() == "i":
-            status_id = match.group(2)
-            url_username = saved_handle
-            proof_url = f"https://x.com/{saved_handle}/status/{status_id}"
- 
-        if url_username != saved_handle:
-            await delete_submission(submission_id)
-            return {"verified": False, "message": "Error, do the task and try again."}
- 
-        tag_check = await check_tag_via_oembed(proof_url, required_tag)
-        if not tag_check["success"]:
-            await delete_submission(submission_id)
-            return {"verified": False, "message": tag_check["message"]}
- 
-        sub_data = supabase.table("submissions") \
-            .select("faucet_address") \
-            .eq("submission_id", submission_id) \
-            .execute()
-        faucet_addr = sub_data.data[0]["faucet_address"] if sub_data.data else ""
- 
-        supabase.table("submissions").update({"status": "approved"}) \
-            .eq("submission_id", submission_id).execute()
-        await process_auto_approval(submission_id, faucet_address=faucet_addr, wallet_address=wallet)
- 
-        try:
-            quest_res = supabase.table("quests").select("chain_id") \
-                .eq("faucet_address", faucet_addr).execute()
-            chain_id = quest_res.data[0].get("chain_id", 42220) if quest_res.data else 42220
-            background_tasks.add_task(
-                _trigger_quest_action_onchain,
-                faucet_addr, wallet, "submitQuest", chain_id
-            )
-        except Exception as e:
-            print(f"⚠️ on-chain submit trigger failed: {e}")
- 
-        return {"verified": True, "message": "✅ Post verified! Points awarded."}
- 
-    except Exception as e:
-        print(f"X Share Verify Error: {e}")
-        await delete_submission(submission_id)   # guaranteed cleanup
-        return {"verified": False, "message": "Something went wrong during verification. Try again."}
- 
+
  
 # ══════════════════════════════════════════════════════════════
 # 7. PATCHED  verify_x_quote
